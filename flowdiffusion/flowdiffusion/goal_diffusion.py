@@ -548,7 +548,12 @@ class GoalGaussianDiffusion(nn.Module):
     def ddim_sample(self, img, shape, x_cond, task_embed, target_timestep, return_all_timesteps=False):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
-        times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        if target_timestep is None:
+            target_timestep = 100
+            times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)
+        else:
+            times = torch.linspace(-1, target_timestep - 1, steps = sampling_timesteps + 1)     #100       10
+        #times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
@@ -592,13 +597,19 @@ class GoalGaussianDiffusion(nn.Module):
         ret = self.unnormalize(ret)
         #采样10步时，draft_tokens应为包含11个tensor的list[img(x99), x89, ..., x9, x_start]  img(x99),
         #t_list应为包含10个tensor的list[99, 89, ..., 9]
-        return ret, draft_tokens, t_list
+        return ret, draft_tokens, t_list, target_timestep
     
     @torch.no_grad()
     def target_sample(self, t_list, draft_tokens, shape, x_cond, task_embed, target_timestep, return_all_timesteps=False):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
-        times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        if target_timestep is None:
+            target_timestep = 100
+            times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)
+        else:
+            times = torch.linspace(-1, target_timestep - 1, steps = sampling_timesteps + 1)
+
+        #times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
@@ -652,41 +663,103 @@ class GoalGaussianDiffusion(nn.Module):
         return target_tokens
 
     @torch.no_grad()
-    def speculative_decoding(self, shape, x_cond, text, draft_model, target_timestep, return_all_timesteps=False):
+    def speculative_decoding(self, shape, x_cond, text, draft_model, target_timestep=100, return_all_timesteps=False):
         device = self.betas.device
         img = torch.randn(shape, device=device) #初始化高斯噪声
         imgs = []
         good_tokens = [] 
+        current_timestep = target_timestep  # 当前要从哪个时间步开始采样
+        max_retries = 3  # 防止无限循环
+        retry_count = 0
 
-        while True:
-            #第一步可以加上T相关的参数target_timestpe方便后面代码
-            #下一个循环img就要改成good_tokens[-1], 并且target_timestep要改成也没什么用，改成reject_index相关的作为下一次开始draft采样的开始时间步
-            ret, draft_tokens, t_list = self.ddim_sample(img, shape, x_cond, text, target_timestep, return_all_timesteps=True) 
+        while True:  # 保持原始注释中的while True逻辑
+            print(f"[Speculative Loop] Starting from timestep: {current_timestep} (retry: {retry_count})")
+            
+            # 第一步可以加上T相关的参数target_timestpe方便后面代码
+            # 下一个循环img就要改成good_tokens[-1], 并且target_timestep要改成reject_index相关的作为下一次开始draft采样的开始时间步
+            if len(good_tokens) > 0:
+                # 从最后一个good token开始继续采样  
+                start_img = good_tokens[-1]
+                print(f"[Speculative Loop] Continue from good_tokens[-1], total good: {len(good_tokens)}")
+            else:
+                # 第一次循环，从初始噪声开始
+                start_img = img
+                print("[Speculative Loop] Starting from initial noise")
+            
+            # 检查时间步是否有效
+            if current_timestep <= 0:
+                print("[Speculative Loop] Timestep <= 0, ending generation")
+                if good_tokens:
+                    imgs.append(good_tokens[-1])
+                else:
+                    imgs.append(start_img)
+                break
+            
+            # Draft采样：从current_timestep开始快速采样
+            ret, draft_tokens, t_list, target_timestep = self.ddim_sample(
+                start_img, shape, x_cond, text, current_timestep, return_all_timesteps=True
+            ) 
 
-            target_tokens = self.target_sample(t_list, draft_tokens, shape, x_cond, text, target_timestep, return_all_timesteps=True)
+            # Target验证：在draft基础上精确采样
+            target_tokens = self.target_sample(
+                t_list, draft_tokens, shape, x_cond, text, current_timestep, return_all_timesteps=True
+            )
         
-            #比较draft_tokens和target_tokens, 对应位置dt去头tt去尾
+            # 比较draft_tokens和target_tokens, 对应位置dt去头tt去尾
             # draft_tokens = [img(x99), x89, ..., x9, x_start] len = 11
-            # draft_tokens = [draft_tokens[x] for x in range(len(draft_tokens) - 1)]  去掉img len = 10
             # target_tokens[x89, x79, x69, x59, x49, x39, x29, x19, x9, x0] len = 10
-            # if all tokens are the same, breakimg
-            # 等等，我为什么要验证？因为target是在draft的基础上精细生成的，已经有了我直接用不就好了（ 但问题是误差累积，假设
-            # draft中x59已经误差比较大了，即x59和x59'不接受，那么在x59的基础上精细生成的x49'也没法用啊
-            # 所以需要从x59'开始重新用draft开始采样，因为x59'是从x69采样得到的，这里假设x69和x69'是接受的
-
+            print(f"[Speculative Loop] Draft tokens: {len(draft_tokens)}, Target tokens: {len(target_tokens)}")
+            
             is_all_accept, reject_index = self.compare_tokens(draft_tokens, target_tokens, sim_threshold=0.75)
 
             if is_all_accept:
-                print("All tokens accepted, breaking the loop.")
-                imgs.append(ret)
+                # if all tokens are the same, break
+                good_tokens.extend(target_tokens)
+                print(f"[Speculative Loop] All tokens accepted, breaking the loop. Total: {len(good_tokens)}")
+                imgs.append(ret)  # 使用原始的ret作为最终结果
                 break
             else:
-                good_tokens = target_tokens[:reject_index]  # reject_index后面的丢掉
-                pass
-        return 
+                # 等等，我为什么要验证？因为target是在draft的基础上精细生成的，已经有了我直接用不就好了
+                # 但问题是误差累积，假设draft中x59已经误差比较大了，即x59和x59'不接受
+                # 那么在x59的基础上精细生成的x49'也没法用啊
+                # 所以需要从x59'开始重新用draft开始采样，因为x59'是从x69采样得到的，这里假设x69和x69'是接受的
+                
+                if reject_index > 0:
+                    # reject_index后面的丢掉，保留前面accept的部分
+                    accepted_tokens = target_tokens[:reject_index]
+                    good_tokens.extend(accepted_tokens)
+                    print(f"[Speculative Loop] Accepted {reject_index}/{len(target_tokens)} tokens")
+                    
+                    # 关键修正：从t_list中获取reject位置对应的真实时间步
+                    # 这样确保下次采样从正确的时间步开始
+                    if reject_index < len(t_list):
+                        current_timestep = t_list[reject_index].item()
+                        print(f"[Speculative Loop] Next timestep from t_list[{reject_index}]: {current_timestep}")
+                        retry_count = 0  # 重置重试计数
+                    else:
+                        # 如果reject_index超出t_list范围，说明采样已经结束
+                        current_timestep = 0
+                        print("[Speculative Loop] Reject index exceeds t_list, ending generation")
+                        if good_tokens:
+                            imgs.append(good_tokens[-1])
+                        else:
+                            imgs.append(start_img)
+                        break
+                else:
+                    print("[Speculative Loop] No tokens accepted in this round, retrying")
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        print(f"[Speculative Loop] Max retries ({max_retries}) reached, ending generation")
+                        if good_tokens:
+                            imgs.append(good_tokens[-1])
+                        else:
+                            imgs.append(start_img)
+                        break
+                    # 如果没有token被接受，保持相同的时间步重试
+                    
+        return good_tokens, imgs 
 
-    @torch.no_grad()
-    def compare_tokens(draft_tokens, target_tokens, sim_threshold=0.75):
+    def compare_tokens(self, draft_tokens, target_tokens, sim_threshold=0.75):
         """
         draft_tokens: [x99, x89, ..., x0]  → length = N
         target_tokens: [x98', x88', ..., x0']  → length = N
@@ -721,11 +794,35 @@ class GoalGaussianDiffusion(nn.Module):
         return is_all_accept, reject_index
 
     @torch.no_grad()   #sample-speculative_decoding-sample_fn
-    def sample(self, x_cond, task_embed, draft_model, target_timestep, batch_size = 16, return_all_timesteps = False):
+    def sample(self, x_cond, task_embed, draft_model=True, target_timestep=99, batch_size = 16, return_all_timesteps = False):
         image_size, channels = self.image_size, self.channels
+        
+        # 如果提供了draft_model，使用speculative decoding
+        if draft_model is True:
+            good_tokens, imgs = self.speculative_decoding(
+                (batch_size, channels, image_size[0], image_size[1]), 
+                x_cond, task_embed, draft_model, target_timestep, 
+                return_all_timesteps = return_all_timesteps
+            )
+            # 返回最终生成的图像
+            if imgs:
+                return imgs[-1]
+            #elif good_tokens:
+                #return good_tokens[-1]
+        
+        # 标准采样流程（保持向后兼容）
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        ret, draft_tokens = sample_fn((batch_size, channels, image_size[0], image_size[1]), x_cond, task_embed, return_all_timesteps = return_all_timesteps)
-        tokens = self.speculative_decoding((batch_size, channels, image_size[0], image_size[1]), x_cond, task_embed, draft_model, target_timestep, return_all_timesteps = return_all_timesteps)
+        
+        if sample_fn == self.ddim_sample:
+            # ddim_sample的调用方式：ddim_sample(img, shape, x_cond, task_embed, target_timestep, return_all_timesteps)
+            shape = (batch_size, channels, image_size[0], image_size[1])
+            # 使用 .cuda() 来避免device类型问题
+            img = torch.randn(shape).cuda() if torch.cuda.is_available() else torch.randn(shape)
+            ret, _, _ = sample_fn(img, shape, x_cond, task_embed, target_timestep, return_all_timesteps)
+        else:
+            # p_sample_loop的调用方式：p_sample_loop(shape, x_cond, task_embed, return_all_timesteps)
+            ret = sample_fn((batch_size, channels, image_size[0], image_size[1]), x_cond, task_embed, return_all_timesteps = return_all_timesteps)
+        
         return ret
 
     @torch.no_grad()
